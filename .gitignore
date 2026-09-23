@@ -1,0 +1,22 @@
+# Runtime-generated, never commit (private key / local-only)
+cert.pem
+key.pem
+connect_qr.png
+mouse3d.log
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pyautogui
+qrcode[pil]
+pystray

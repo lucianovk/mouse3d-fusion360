@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Mouse 3D - Fusion 360</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #111; color: #eee;
+    font-family: -apple-system, Roboto, Segoe UI, sans-serif;
+    touch-action: none; user-select: none;
+  }
+  #bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; background: #1b1b1b;
+    border-bottom: 1px solid #333;
+  }
+  #status { width: 10px; height: 10px; border-radius: 50%; background: #c0392b; flex-shrink: 0; }
+  #status.ok { background: #27ae60; }
+  #imuControls { margin-left: auto; display: flex; gap: 6px; }
+  #imuModeSel { display: flex; border: 1px solid #444; border-radius: 6px; overflow: hidden; }
+  .imuModeBtn {
+    background: #2a2a2a; color: #888; border: none;
+    padding: 8px 9px; font-size: 12px;
+  }
+  .imuModeBtn.active { background: #3a3a3a; color: #fff; }
+  #imuToggle {
+    background: #2a2a2a; color: #aaa; border: 1px solid #444;
+    border-radius: 6px; padding: 8px 12px; font-size: 14px;
+  }
+  #imuToggle.active { background: #3567e0; color: #fff; border-color: #3567e0; }
+  #reloadBtn {
+    background: #2a2a2a; color: #aaa; border: 1px solid #444;
+    border-radius: 6px; width: 34px; height: 34px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; line-height: 1; flex-shrink: 0;
+  }
+  #reloadBtn:active { background: #3567e0; color: #fff; border-color: #3567e0; }
+  #sensRow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 12px; background: #17171a;
+    border-bottom: 1px solid #333;
+    font-size: 12px; color: #888;
+  }
+  #sensRow input[type="range"] { flex: 1; accent-color: #3567e0; }
+  #sensValue { min-width: 44px; text-align: right; color: #ccc; font-variant-numeric: tabular-nums; }
+  #pad {
+    position: absolute; top: 78px; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(circle at 50% 50%, #1a1a1a, #0a0a0a);
+    display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 20px; font-size: 15px; color: #666;
+    line-height: 1.6;
+  }
+  #pad.holding { background: radial-gradient(circle at 50% 50%, #24324f, #0a0a0a); }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <div id="status"></div>
+    <span id="statusTxt">connecting...</span>
+    <div id="imuControls">
+      <div id="imuModeSel">
+        <button class="imuModeBtn active" data-imode="absolute" title="The model orbits together with the phone">Abs</button>
+        <button class="imuModeBtn" data-imode="relative" title="Orbit speed proportional to tilt">Rel</button>
+      </div>
+      <button id="imuToggle" class="active">IMU</button>
+    </div>
+    <button id="reloadBtn" title="Reload">&#8635;</button>
+  </div>
+
+  <div id="sensRow">
+    <span>IMU sens.</span>
+    <input type="range" id="imuSensSlider" min="0.25" max="3" step="0.05" value="1">
+    <span id="sensValue">1.00x</span>
+  </div>
+
+  <div id="pad">
+    <div>
+      <span id="padHint">1 finger = orbit (drag, or hold and tilt/twist if the IMU button is on) &middot; 2 fingers = pan &middot; pinch = zoom</span>
+      <div id="imuDebug" style="display:none; margin-top:14px; font-size:12px; color:#e07b39; line-height:1.6;"></div>
+    </div>
+  </div>
+
+<script>
+const statusDot = document.getElementById('status');
+const statusTxt = document.getElementById('statusTxt');
+const pad = document.getElementById('pad');
+const padHint = document.getElementById('padHint');
+const imuToggle = document.getElementById('imuToggle');
+const imuModeBtns = document.querySelectorAll('.imuModeBtn');
+
+// ---------- Persisted UI state (survives page reloads) ----------
+function loadPref(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v;
+  } catch (e) { return fallback; }
+}
+function savePref(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* private mode etc: ignore */ }
+}
+
+let imuEnabled = loadPref('mouse3d_imuEnabled', '1') === '1'; // tilt contributes to orbit whenever a 1-finger touch is held
+let imuAngleMode = loadPref('mouse3d_imuAngleMode', 'absolute'); // 'absolute' | 'relative'
+// Multiplies all IMU sensitivity constants (ABS_SENS, REL_SENS, GYRO_Z_SENS)
+// at the point of use — 1.00x is the calibrated baseline (90° of tilt =
+// 90° of orbit in Fusion), so this scales that baseline up or down live.
+let imuSensMultiplier = parseFloat(loadPref('mouse3d_imuSens', '1'));
+let ws = null;
+
+// Sync the UI to whatever was loaded above (HTML defaults to IMU on /
+// Absolute / 1.00x, which are also the fallbacks, but this keeps them in
+// sync when a saved preference differs from that default).
+imuToggle.classList.toggle('active', imuEnabled);
+imuToggle.textContent = imuEnabled ? 'IMU' : 'IMU off';
+imuModeBtns.forEach(b => b.classList.toggle('active', b.dataset.imode === imuAngleMode));
+
+const imuSensSlider = document.getElementById('imuSensSlider');
+const sensValueEl = document.getElementById('sensValue');
+imuSensSlider.value = imuSensMultiplier;
+sensValueEl.textContent = imuSensMultiplier.toFixed(2) + 'x';
+imuSensSlider.addEventListener('input', () => {
+  imuSensMultiplier = parseFloat(imuSensSlider.value);
+  sensValueEl.textContent = imuSensMultiplier.toFixed(2) + 'x';
+  savePref('mouse3d_imuSens', imuSensMultiplier);
+});
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    statusDot.classList.add('ok');
+    statusTxt.textContent = 'connected';
+    // The server always starts a fresh (idle) session on a new connection,
+    // so force our belief back in sync with it, then re-request whatever
+    // should currently be active (e.g. IMU orbit) on this live socket.
+    serverSession = null;
+    recomputeSession();
+  };
+  ws.onclose = () => { statusDot.classList.remove('ok'); statusTxt.textContent = 'disconnected - reconnecting...'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+}
+connect();
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+document.getElementById('reloadBtn').addEventListener('click', () => location.reload());
+
+// ---------- Keep the screen awake while this page is open ----------
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (err) { /* denied or unsupported: ignore, screen may still sleep */ }
+}
+requestWakeLock();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') requestWakeLock();
+});
+
+imuToggle.addEventListener('click', () => {
+  imuEnabled = !imuEnabled;
+  savePref('mouse3d_imuEnabled', imuEnabled ? '1' : '0');
+  imuToggle.classList.toggle('active', imuEnabled);
+  imuToggle.textContent = imuEnabled ? 'IMU' : 'IMU off';
+  if (imuEnabled) {
+    requestOrientationPermission();
+  } else {
+    document.getElementById('imuDebug').style.display = 'none';
+  }
+  // If a touch-orbit is in progress, its server session is untouched by
+  // this toggle (only whether IMU's own deltas get added to it changes).
+});
+
+imuModeBtns.forEach(btn => btn.addEventListener('click', () => {
+  imuAngleMode = btn.dataset.imode;
+  savePref('mouse3d_imuAngleMode', imuAngleMode);
+  imuModeBtns.forEach(b => b.classList.toggle('active', b === btn));
+  imuRef = null; // rebaseline: absolute tracks from here, relative measures offset from here
+}));
+
+// ---------- Sensitivity ----------
+const TOUCH_SENS = 1.6;
+const ZOOM_SENS = 1.8;
+const GESTURE_LOCK_PX = 10; // combined movement needed before pan/zoom is decided
+
+// ---------- Shared server session (orbit XOR pan; zoom is stateless) ----------
+// Touch and IMU both want to drive "orbit"; either can hold it open, and
+// the session only actually starts/ends on the server when the combined
+// desire changes. Pan is exclusive (same physical mouse button as orbit,
+// just without Shift), so a 2-finger pan drag always wins and IMU orbit
+// is paused for its duration.
+let serverSession = null; // null | 'orbit' | 'pan'
+let touchGesture = null;  // null | 'orbit' | 'pan-pending' | 'pan' | 'zoom'
+
+function setServerSession(desired) {
+  if (desired === serverSession) return;
+  if (serverSession !== null) send({ type: 'end' });
+  if (desired !== null) send({ type: 'start', mode: desired });
+  serverSession = desired;
+}
+
+function recomputeSession() {
+  // Orbit (whether by finger-drag, tilt, or twist) only ever opens while
+  // a finger is actually touching the pad — IMU alone (even with the
+  // button on) never opens it by itself. Keeping Shift+middle-mouse held
+  // down system-wide without an active touch interferes with normal use
+  // of the PC (typing, clicking, shortcuts) — see imuToggle's history.
+  let desired = null;
+  if (touchGesture === 'pan') desired = 'pan';
+  else if (touchGesture === 'orbit') desired = 'orbit';
+  setServerSession(desired);
+}
+
+let lastX = 0, lastY = 0, lastDist = 0;
+// Two-finger gesture classification, decided once per touch and then
+// locked until the fingers are lifted (prevents pan/zoom flip-flopping
+// mid-gesture, which was cutting zoom-out short).
+let twoFingerLock = null; // null (undecided) | 'pan' | 'zoom'
+let twoFingerAnchor = null; // { cx, cy, dist } captured when the 2nd finger lands
+
+function dist(t0, t1) {
+  return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+}
+function centroid(touches) {
+  let x = 0, y = 0;
+  for (const t of touches) { x += t.clientX; y += t.clientY; }
+  return { x: x / touches.length, y: y / touches.length };
+}
+
+pad.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  pad.classList.add('holding');
+  const t = e.touches;
+  if (t.length === 1) {
+    touchGesture = 'orbit';
+    lastX = t[0].clientX; lastY = t[0].clientY;
+    recomputeSession();
+  } else if (t.length >= 2) {
+    touchGesture = 'pan-pending';
+    twoFingerLock = null;
+    // End any orbit session left over from a 1st finger that was already
+    // down (e.g. touching to orbit, then adding a 2nd finger to pinch) —
+    // otherwise Shift can stay held through a pinch that resolves to
+    // zoom, and Shift+scroll isn't the same as a plain scroll in Fusion.
+    recomputeSession();
+    const c = centroid([t[0], t[1]]);
+    const d = dist(t[0], t[1]);
+    twoFingerAnchor = { cx: c.x, cy: c.y, dist: d };
+    lastX = c.x; lastY = c.y; lastDist = d;
+  }
+}, { passive: false });
+
+pad.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const t = e.touches;
+  if (t.length === 1 && touchGesture === 'orbit') {
+    const dx = (t[0].clientX - lastX) * TOUCH_SENS;
+    const dy = (t[0].clientY - lastY) * TOUCH_SENS;
+    if (serverSession === 'orbit') send({ type: 'move', dx, dy });
+    lastX = t[0].clientX; lastY = t[0].clientY;
+    return;
+  }
+  if (t.length < 2) return;
+
+  const c = centroid([t[0], t[1]]);
+  const d = dist(t[0], t[1]);
+
+  if (touchGesture === 'pan-pending') {
+    // Undecided: wait for enough combined movement to tell pan from pinch,
+    // then lock the classification for the rest of this gesture so it
+    // can't flip mid-way (that was cutting pinch-to-zoom-out short).
+    const totalPan = Math.hypot(c.x - twoFingerAnchor.cx, c.y - twoFingerAnchor.cy);
+    const totalZoom = Math.abs(d - twoFingerAnchor.dist);
+    if (Math.max(totalPan, totalZoom) < GESTURE_LOCK_PX) return;
+    touchGesture = totalZoom > totalPan ? 'zoom' : 'pan';
+    if (touchGesture === 'pan') recomputeSession(); // pauses IMU orbit, starts pan
+    lastX = c.x; lastY = c.y; lastDist = d; // avoid a jump on the first locked frame
+    return;
+  }
+
+  if (touchGesture === 'pan') {
+    const dCx = (c.x - lastX) * TOUCH_SENS;
+    const dCy = (c.y - lastY) * TOUCH_SENS;
+    if (serverSession === 'pan') send({ type: 'move', dx: dCx, dy: dCy });
+    lastX = c.x; lastY = c.y;
+  } else if (touchGesture === 'zoom') {
+    // Pinch open (fingers apart) = zoom in; pinch closed = zoom out.
+    const dDist = (d - lastDist) * ZOOM_SENS;
+    send({ type: 'zoom', delta: dDist });
+    lastDist = d;
+  }
+}, { passive: false });
+
+pad.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  const t = e.touches;
+  const wasZoom = touchGesture === 'zoom';
+  twoFingerLock = null;
+  twoFingerAnchor = null;
+  pad.classList.remove('holding');
+  if (t.length === 0) {
+    touchGesture = null;
+    recomputeSession(); // drops to idle, unless IMU keeps orbit open
+  } else if (t.length === 1) {
+    if (wasZoom) {
+      // The two fingers of a pinch rarely lift at exactly the same
+      // instant. Resuming single-finger orbit for that split-second
+      // before the last finger lifts too used to open (and immediately
+      // close) a real orbit session — a stray middle-click that was
+      // resetting the zoom level right after the gesture. Just end here
+      // instead and wait for a fresh touch.
+      touchGesture = null;
+      recomputeSession();
+    } else {
+      // transitioned from 2-finger PAN to 1-finger: resume single-finger orbit
+      touchGesture = 'orbit';
+      lastX = t[0].clientX; lastY = t[0].clientY;
+      recomputeSession();
+    }
+  }
+}, { passive: false });
+
+// ---------- IMU handling ----------
+// Both control modes need an actual tilt ANGLE (not angular velocity), so
+// this uses the Generic Sensor API's orientation sensors (quaternion,
+// converted to beta/gamma-style angles below). Legacy DeviceOrientationEvent
+// (which already gives angles directly) is kept as a fallback for browsers
+// that still dispatch it.
+let imuRef = null; // reference {beta, gamma} captured at the moment you touch the screen
+let sensorLastTime = null;
+const ABS_SENS = 8.25;        // absolute mode: degrees of tilt -> pixel-equivalent deltas (calibrated 1:1, +10%)
+const REL_SENS = 10.0;        // relative mode: degrees of offset from touch-start -> pixels/second
+const REL_DEADZONE_DEG = 1.5; // ignore tiny offsets so a steady hand doesn't drift
+
+function deadzone(v, dz) {
+  if (Math.abs(v) < dz) return 0;
+  return v - Math.sign(v) * dz;
+}
+
+// Converts a Generic Sensor orientation quaternion [x,y,z,w] to
+// DeviceOrientationEvent-style beta (front-back tilt) / gamma (left-right
+// tilt) angles in degrees, close enough for relative-motion control.
+function anglesFromQuaternion(q) {
+  const [x, y, z, w] = q;
+  const t0 = 2 * (w * x + y * z);
+  const t1 = 1 - 2 * (x * x + y * y);
+  const beta = Math.atan2(t0, t1) * 180 / Math.PI;
+  let t2 = 2 * (w * y - z * x);
+  t2 = Math.max(-1, Math.min(1, t2));
+  const gamma = Math.asin(t2) * 180 / Math.PI;
+  return { beta, gamma };
+}
+
+function handleTiltAngles(beta, gamma, sourceLabel, dt) {
+  imuEventCount++;
+
+  let status;
+  if (!imuEnabled) status = ' · IMU off';
+  else if (serverSession === 'orbit') status = ' · orbiting';
+  else status = ' · touch screen to activate';
+  setImuDebug(`[${sourceLabel}/${imuAngleMode}] event #${imuEventCount} · β=${beta.toFixed(1)} γ=${gamma.toFixed(1)}${status}`);
+  if (!imuEnabled || serverSession !== 'orbit') { imuRef = null; return; }
+
+  if (imuAngleMode === 'absolute') {
+    // Model orbits together with the phone: send the frame-to-frame
+    // angle delta, so the total sent since you touched the screen equals
+    // the total tilt change since then (1:1-ish position tracking).
+    if (imuRef === null) { imuRef = { beta, gamma }; return; }
+    const dGamma = (gamma - imuRef.gamma) * ABS_SENS * imuSensMultiplier;
+    const dBeta = (beta - imuRef.beta) * ABS_SENS * imuSensMultiplier;
+    send({ type: 'move', dx: dGamma, dy: dBeta });
+    imuRef = { beta, gamma };
+  } else {
+    // Relative: imuRef stays fixed at the angle you were at when you
+    // touched the screen. Orbit SPEED is proportional to how far the
+    // phone is tilted away from that starting position right now.
+    if (imuRef === null) { imuRef = { beta, gamma }; return; }
+    if (!dt || dt <= 0) return;
+    const offGamma = deadzone(gamma - imuRef.gamma, REL_DEADZONE_DEG);
+    const offBeta = deadzone(beta - imuRef.beta, REL_DEADZONE_DEG);
+    const dx = offGamma * REL_SENS * imuSensMultiplier * dt;
+    const dy = offBeta * REL_SENS * imuSensMultiplier * dt;
+    if (dx || dy) send({ type: 'move', dx, dy });
+  }
+}
+
+function onOrientation(e) {
+  if (e.beta === null || e.gamma === null) {
+    imuEventCount++;
+    setImuDebug(`[legacy] sensor active but beta/gamma are null (event #${imuEventCount})`);
+    return;
+  }
+  const now = performance.now();
+  const dt = sensorLastTime === null ? 0 : (now - sensorLastTime) / 1000;
+  sensorLastTime = now;
+  handleTiltAngles(e.beta, e.gamma, 'legacy', dt);
+}
+
+let orientationSensor = null;
+
+function startOrientationSensor() {
+  const Ctor = ('RelativeOrientationSensor' in window) ? RelativeOrientationSensor
+    : ('AbsoluteOrientationSensor' in window) ? AbsoluteOrientationSensor
+    : null;
+  if (!Ctor) return false;
+  try {
+    orientationSensor = new Ctor({ frequency: 60 });
+    orientationSensor.addEventListener('reading', () => {
+      const now = performance.now();
+      const dt = sensorLastTime === null ? 0 : (now - sensorLastTime) / 1000;
+      sensorLastTime = now;
+      const { beta, gamma } = anglesFromQuaternion(orientationSensor.quaternion);
+      handleTiltAngles(beta, gamma, 'sensor', dt);
+    });
+    orientationSensor.addEventListener('error', (event) => {
+      setImuDebug(`[sensor] error: ${event.error.name} - ${event.error.message}`);
+    });
+    orientationSensor.start();
+    return true;
+  } catch (err) {
+    setImuDebug(`[sensor] failed to start: ${err.message}`);
+    return false;
+  }
+}
+
+// ---------- Gyroscope Z axis: twist the phone like a dial (rotation
+// around the axis pointing straight out of the screen) also spins the
+// orbit horizontally. This is independent of tilt/beta/gamma, so it
+// still works even when the phone is lying flat on a table.
+let gyroZSensor = null;
+let gyroZLastTime = null;
+const GYRO_Z_SENS = 137.5; // rad/s * dt (radians) -> pixel-equivalent horizontal delta (same calibration as ABS_SENS, +10%)
+
+function startGyroZSensor() {
+  if (!('Gyroscope' in window)) return false;
+  try {
+    gyroZSensor = new Gyroscope({ frequency: 60 });
+    gyroZSensor.addEventListener('reading', () => {
+      const now = performance.now();
+      const dt = gyroZLastTime === null ? 0 : (now - gyroZLastTime) / 1000;
+      gyroZLastTime = now;
+      if (dt <= 0) return;
+      const dx = gyroZSensor.z * dt * GYRO_Z_SENS * imuSensMultiplier;
+      if (Math.abs(dx) > 0.05 && imuEnabled && serverSession === 'orbit') {
+        send({ type: 'move', dx, dy: 0 });
+      }
+    });
+    gyroZSensor.addEventListener('error', () => { /* non-critical: tilt still works without it */ });
+    gyroZSensor.start();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+const imuDebugEl = document.getElementById('imuDebug');
+let imuEventCount = 0;
+let lastDebugSend = 0;
+let imuListenerAdded = false;
+
+function setImuDebug(text) {
+  // Not shown on the phone screen anymore — still relayed to the PC's
+  // server log below, which is where it's actually read from now.
+  const now = Date.now();
+  if (now - lastDebugSend > 700) {
+    lastDebugSend = now;
+    send({ type: 'debug', text });
+  }
+}
+
+function sendDiagnostics() {
+  const info = {
+    secureContext: window.isSecureContext,
+    hasDOE: typeof DeviceOrientationEvent !== 'undefined',
+    hasRequestPermission: typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function',
+    ua: navigator.userAgent,
+  };
+  send({ type: 'debug', text: `diag: secureContext=${info.secureContext} hasDeviceOrientationEvent=${info.hasDOE} hasRequestPermission=${info.hasRequestPermission}` });
+  send({ type: 'debug', text: `diag sensors: Gyroscope=${'Gyroscope' in window} Accelerometer=${'Accelerometer' in window} AbsoluteOrientationSensor=${'AbsoluteOrientationSensor' in window} RelativeOrientationSensor=${'RelativeOrientationSensor' in window}` });
+  send({ type: 'debug', text: `diag ua: ${info.ua}` });
+  if (navigator.permissions && navigator.permissions.query) {
+    ['accelerometer', 'gyroscope', 'magnetometer'].forEach(name => {
+      navigator.permissions.query({ name }).then(status => {
+        send({ type: 'debug', text: `diag permission ${name}: ${status.state}` });
+      }).catch(err => {
+        send({ type: 'debug', text: `diag permission ${name}: query unsupported (${err.message})` });
+      });
+    });
+  } else {
+    send({ type: 'debug', text: 'diag: navigator.permissions.query not available' });
+  }
+}
+
+let gyroZListenerAdded = false;
+
+function requestOrientationPermission() {
+  setImuDebug('waiting for sensor...');
+  sendDiagnostics();
+
+  if (!gyroZListenerAdded) gyroZListenerAdded = startGyroZSensor();
+
+  if (imuListenerAdded) return;
+
+  // Preferred: modern Generic Sensor API (gives an actual tilt angle).
+  if (startOrientationSensor()) {
+    imuListenerAdded = true;
+  } else if (typeof DeviceOrientationEvent === 'undefined') {
+    setImuDebug('No sensor API available (neither Gyroscope nor DeviceOrientationEvent).');
+    return;
+  } else if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission().then(state => {
+      if (state === 'granted') {
+        window.addEventListener('deviceorientation', onOrientation);
+        imuListenerAdded = true;
+      } else {
+        setImuDebug('Motion sensor permission denied.');
+      }
+    }).catch(() => setImuDebug('Error requesting sensor permission.'));
+  } else {
+    window.addEventListener('deviceorientation', onOrientation);
+    imuListenerAdded = true;
+  }
+
+  setTimeout(() => {
+    if (imuEventCount === 0 && imuEnabled) {
+      setImuDebug('No sensor events arrived (neither gyro nor legacy). Check the site permissions (padlock/info icon > Permissions) or whether the device has a gyroscope.');
+    }
+  }, 1500);
+}
+
+requestOrientationPermission(); // IMU starts enabled by default
+// (the orbit session itself is opened from ws.onopen, once the socket is
+// actually ready to receive it — see connect() above)
+
+</script>
+</body>
+</html>
