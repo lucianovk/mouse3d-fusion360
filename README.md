@@ -1,5 +1,8 @@
 # Mouse 3D — Phone-as-3D-Mouse for Fusion 360
 
+**[⬇ Download Mouse3D.exe](https://github.com/lucianovk/mouse3d-fusion360/releases/latest)**
+— a self-contained Windows app, no Python install needed.
+
 Turn an Android phone into a wireless 3D navigation controller for
 Autodesk Fusion 360 — no dedicated hardware required. A small system-tray
 app on your PC serves a page to your phone's browser; the phone reads its
